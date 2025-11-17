@@ -2,11 +2,13 @@ import websocket
 import json
 import threading
 import os
+import time
 import requests
 from candle_aggregator import add_tick, get_candles
 from supabase import create_client
 
-SUPABASE_REALTIME_URL = "wss://qqsxwhmryfzvrugbqzks.supabase.co/realtime/v1/websocket"
+# 🔐 Environment variables
+SUPABASE_REALTIME_URL = f"{os.getenv('SUPABASE_URL')}/realtime/v1/websocket"
 SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -33,9 +35,9 @@ def on_watchlist_update(ws, message):
     if data.get("event") in ["INSERT", "UPDATE", "DELETE"]:
         print("🔄 Watchlist changed — refreshing symbols...")
         refresh_symbols()
-        # TODO: re-subscribe to TwelveData WebSocket with new SYMBOLS
 
 def subscribe_to_watchlist():
+    """Subscribe to Supabase realtime watchlist changes."""
     def run():
         ws = websocket.WebSocketApp(
             f"{SUPABASE_REALTIME_URL}?apikey={SUPABASE_API_KEY}&vsn=1.0.0",
@@ -51,6 +53,19 @@ def subscribe_to_watchlist():
 
     threading.Thread(target=run).start()
 
+def handle_price_message(message):
+    data = json.loads(message)
+    if "symbol" in data:
+        add_tick(data["symbol"], float(data["price"]), int(data["timestamp"]))
+
+def subscribe_symbols(ws):
+    if SYMBOLS:
+        ws.send(json.dumps({
+            "action": "subscribe",
+            "params": {"symbols": ",".join(SYMBOLS)}
+        }))
+        print("📡 Subscribed to:", SYMBOLS)
+
 def start_stream():
     """Start TwelveData WebSocket and push candles to backend."""
     def run():
@@ -64,23 +79,8 @@ def start_stream():
     threading.Thread(target=run).start()
 
     while True:
-        # Every minute, aggregate ticks into candles and push to backend
-        import time
         time.sleep(60)
         for symbol in SYMBOLS:
             candles = get_candles(symbol)
             if candles:
                 requests.post(BACKEND_URL, json={"symbol": symbol, "candles": candles})
-
-def subscribe_symbols(ws):
-    if SYMBOLS:
-        ws.send(json.dumps({
-            "action": "subscribe",
-            "params": {"symbols": ",".join(SYMBOLS)}
-        }))
-        print("📡 Subscribed to:", SYMBOLS)
-
-def handle_price_message(message):
-    data = json.loads(message)
-    if "symbol" in data:
-        add_tick(data["symbol"], float(data["price"]), int(data["timestamp"]))
