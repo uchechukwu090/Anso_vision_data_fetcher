@@ -1,6 +1,7 @@
 import websocket
 import json
 import threading
+import os
 
 SUPABASE_REALTIME_URL = "wss://qqsxwhmryfzvrugbqzks.supabase.co/realtime/v1/websocket"
 SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")
