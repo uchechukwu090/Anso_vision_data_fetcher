@@ -3,7 +3,7 @@ import json
 import threading
 
 SUPABASE_REALTIME_URL = "wss://qqsxwhmryfzvrugbqzks.supabase.co/realtime/v1/websocket"
-SUPABASE_API_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")
 
 def on_watchlist_update(ws, message):
     data = json.loads(message)
