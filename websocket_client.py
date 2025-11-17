@@ -1,35 +1,28 @@
-import websocket, json, threading, time, requests
-from candle_aggregator import add_tick, get_candles
+import websocket
+import json
+import threading
 
-API_KEY = "fef3c30aa26c4831924fdb142f87550d"
-SYMBOLS = ["EUR/USD", "BTC/USD"]
-BACKEND_URL = "https://anso-vision-backend.onrender.com/webhook/live"
+SUPABASE_REALTIME_URL = "wss://qqsxwhmryfzvrugbqzks.supabase.co/realtime/v1/websocket"
+SUPABASE_API_KEY = os.getenv("SUPABASE_KEY")
 
-def on_message(ws, message):
+def on_watchlist_update(ws, message):
     data = json.loads(message)
-    if "symbol" in data:
-        add_tick(data["symbol"], float(data["price"]), int(data["timestamp"]))
+    if data.get("event") in ["INSERT", "UPDATE", "DELETE"]:
+        print("🔄 Watchlist changed — refreshing symbols...")
+        refresh_symbols()
 
-def on_open(ws):
-    ws.send(json.dumps({
-        "action": "subscribe",
-        "params": {"symbols": ",".join(SYMBOLS)}
-    }))
-
-def start_stream():
+def subscribe_to_watchlist():
     def run():
         ws = websocket.WebSocketApp(
-            f"wss://ws.twelvedata.com/v1/quotes/price?apikey={API_KEY}",
-            on_message=on_message,
-            on_open=on_open
+            f"{SUPABASE_REALTIME_URL}?apikey={SUPABASE_API_KEY}&vsn=1.0.0",
+            on_message=on_watchlist_update
         )
+        ws.on_open = lambda ws: ws.send(json.dumps({
+            "topic": "realtime:public:watchlist",
+            "event": "phx_join",
+            "payload": {},
+            "ref": "1"
+        }))
         ws.run_forever()
 
     threading.Thread(target=run).start()
-
-    while True:
-        time.sleep(60)
-        for symbol in SYMBOLS:
-            candles = get_candles(symbol)
-            if candles:
-                requests.post(BACKEND_URL, json={"symbol": symbol, "candles": candles})
