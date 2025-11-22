@@ -1,5 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 websocket-client
 requests
 supabase
+websockets

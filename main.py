@@ -1,11 +1,18 @@
 import os
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import requests
+import logging
+import asyncio
+import json
+from typing import Set, Dict
+import websocket as ws_client
+import threading
 
-# Import WebSocket server
-from websocket_server import websocket_endpoint, init_websocket
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Anso Vision Data Fetcher",
@@ -28,17 +35,182 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 FINLIGHT_API_KEY = os.getenv("FINLIGHT_API_KEY")
 BACKEND_URL = os.getenv("BACKEND_URL", "https://anso-vision-backend.onrender.com")
 
+# WebSocket connection manager
+class WebSocketManager:
+    def __init__(self):
+        self.frontend_connections: Set[WebSocket] = set()
+        self.twelvedata_ws = None
+        self.is_connected = False
+        self.subscribed_symbols: Set[str] = set()
+        self.latest_prices: Dict[str, dict] = {}
+        
+    async def connect_frontend(self, websocket: WebSocket):
+        """Accept frontend WebSocket connection"""
+        await websocket.accept()
+        self.frontend_connections.add(websocket)
+        logger.info(f"✅ Frontend client connected. Total: {len(self.frontend_connections)}")
+        
+        # Send current prices
+        if self.latest_prices:
+            try:
+                await websocket.send_json({
+                    "type": "initial_prices",
+                    "prices": self.latest_prices
+                })
+            except:
+                pass
+    
+    def disconnect_frontend(self, websocket: WebSocket):
+        """Remove disconnected frontend client"""
+        self.frontend_connections.discard(websocket)
+        logger.info(f"❌ Frontend client disconnected. Total: {len(self.frontend_connections)}")
+    
+    async def broadcast_price(self, symbol: str, price: float, timestamp: int):
+        """Broadcast price update to all connected frontend clients"""
+        self.latest_prices[symbol] = {
+            "price": price,
+            "timestamp": timestamp
+        }
+        
+        message = {
+            "type": "price_update",
+            "symbol": symbol,
+            "price": price,
+            "timestamp": timestamp
+        }
+        
+        disconnected = set()
+        for connection in self.frontend_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                logger.error(f"Error sending to frontend client: {e}")
+                disconnected.add(connection)
+        
+        # Clean up disconnected clients
+        for conn in disconnected:
+            self.disconnect_frontend(conn)
+    
+    def on_twelvedata_message(self, ws, message):
+        """Handle messages from TwelveData WebSocket"""
+        try:
+            data = json.loads(message)
+            
+            if data.get("event") == "price":
+                symbol = data.get("symbol")
+                price = float(data.get("price", 0))
+                timestamp = int(data.get("timestamp", 0))
+                
+                # Broadcast to frontend clients (run in event loop)
+                asyncio.run_coroutine_threadsafe(
+                    self.broadcast_price(symbol, price, timestamp),
+                    asyncio.get_event_loop()
+                )
+                
+            elif data.get("event") == "subscribe-status":
+                logger.info(f"TwelveData subscription status: {data}")
+                
+        except Exception as e:
+            logger.error(f"Error processing TwelveData message: {e}")
+    
+    def on_twelvedata_error(self, ws, error):
+        logger.error(f"TwelveData WebSocket error: {error}")
+        self.is_connected = False
+    
+    def on_twelvedata_close(self, ws, close_status_code, close_msg):
+        logger.warning(f"TwelveData WebSocket closed: {close_status_code} - {close_msg}")
+        self.is_connected = False
+        
+        # Attempt to reconnect after 5 seconds
+        threading.Timer(5.0, self.connect_to_twelvedata).start()
+    
+    def on_twelvedata_open(self, ws):
+        logger.info("✅ Connected to TwelveData WebSocket")
+        self.is_connected = True
+        
+        # Subscribe to all symbols
+        if self.subscribed_symbols:
+            self.subscribe_symbols(list(self.subscribed_symbols))
+    
+    def connect_to_twelvedata(self):
+        """Connect to TwelveData WebSocket"""
+        if not TWELVEDATA_API_KEY:
+            logger.error("❌ TWELVEDATA_API_KEY not configured")
+            return
+        
+        ws_url = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVEDATA_API_KEY}"
+        
+        self.twelvedata_ws = ws_client.WebSocketApp(
+            ws_url,
+            on_open=self.on_twelvedata_open,
+            on_message=self.on_twelvedata_message,
+            on_error=self.on_twelvedata_error,
+            on_close=self.on_twelvedata_close
+        )
+        
+        # Run in separate thread
+        wst = threading.Thread(target=self.twelvedata_ws.run_forever)
+        wst.daemon = True
+        wst.start()
+        
+        logger.info("📡 TwelveData WebSocket thread started")
+    
+    def subscribe_symbols(self, symbols: list):
+        """Subscribe to symbols on TwelveData"""
+        if not self.twelvedata_ws or not self.is_connected:
+            logger.warning("Cannot subscribe - TwelveData WebSocket not connected")
+            return
+        
+        try:
+            message = {
+                "action": "subscribe",
+                "params": {
+                    "symbols": ",".join(symbols)
+                }
+            }
+            self.twelvedata_ws.send(json.dumps(message))
+            logger.info(f"📡 Subscribed to: {symbols}")
+            
+            for symbol in symbols:
+                self.subscribed_symbols.add(symbol)
+                
+        except Exception as e:
+            logger.error(f"Error subscribing to symbols: {e}")
+    
+    def unsubscribe_symbols(self, symbols: list):
+        """Unsubscribe from symbols on TwelveData"""
+        if not self.twelvedata_ws or not self.is_connected:
+            return
+        
+        try:
+            message = {
+                "action": "unsubscribe",
+                "params": {
+                    "symbols": ",".join(symbols)
+                }
+            }
+            self.twelvedata_ws.send(json.dumps(message))
+            logger.info(f"📡 Unsubscribed from: {symbols}")
+            
+            for symbol in symbols:
+                self.subscribed_symbols.discard(symbol)
+                
+        except Exception as e:
+            logger.error(f"Error unsubscribing from symbols: {e}")
+
+# Global WebSocket manager
+ws_manager = WebSocketManager()
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
-    print("🚀 Data Fetcher Service Starting...")
-    print(f"📊 Backend URL: {BACKEND_URL}")
-    print(f"🔑 TwelveData API: {'Configured' if TWELVEDATA_API_KEY else 'Missing'}")
-    print(f"📰 Finlight API: {'Configured' if FINLIGHT_API_KEY else 'Missing'}")
+    logger.info("🚀 Data Fetcher Service Starting...")
+    logger.info(f"📊 Backend URL: {BACKEND_URL}")
+    logger.info(f"🔑 TwelveData API: {'Configured' if TWELVEDATA_API_KEY else 'Missing'}")
+    logger.info(f"📰 Finlight API: {'Configured' if FINLIGHT_API_KEY else 'Missing'}")
     
-    # Initialize WebSocket connection to TwelveData
-    await init_websocket()
-    print("📡 WebSocket server initialized")
+    # Connect to TwelveData WebSocket
+    ws_manager.connect_to_twelvedata()
 
 @app.get("/")
 async def root():
@@ -47,11 +219,13 @@ async def root():
         "service": "Anso Vision Data Fetcher",
         "version": "2.0.0",
         "status": "running",
+        "websocket_status": "connected" if ws_manager.is_connected else "disconnected",
+        "subscribed_symbols": list(ws_manager.subscribed_symbols),
         "endpoints": {
-            "candles": "/candles/{symbol}",
-            "news": "/news",
-            "health": "/health",
-            "websocket": "/ws"
+            "candles": "/candles/{symbol} - Get historical OHLC for analysis",
+            "news": "/news - Get high-impact news",
+            "health": "/health - Health check",
+            "websocket": "/ws - Real-time price streaming"
         }
     }
 
@@ -63,20 +237,24 @@ async def health_check():
         "service": "Data Fetcher",
         "twelvedata_api": "configured" if TWELVEDATA_API_KEY else "missing",
         "finlight_api": "configured" if FINLIGHT_API_KEY else "missing",
-        "websocket": "enabled"
+        "websocket_connected": ws_manager.is_connected,
+        "subscribed_symbols": list(ws_manager.subscribed_symbols),
+        "frontend_clients": len(ws_manager.frontend_connections)
     }
 
-@app.get("/candles/{symbol}")
+@app.get("/candles/{symbol:path}")
 async def get_candles(
     symbol: str,
     interval: str = "1h",
     outputsize: int = 100
 ):
     """
-    Fetch historical candle data from TwelveData API
+    Fetch historical OHLC candle data from TwelveData REST API
     
-    This centralizes data fetching and hides the API key from frontend
+    This is for ON-DEMAND analysis when user clicks "Analyze"
     """
+    logger.info(f"📊 Fetching candles for {symbol}, interval: {interval}")
+    
     if not TWELVEDATA_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -93,12 +271,15 @@ async def get_candles(
             "format": "JSON"
         }
         
+        logger.info(f"Calling TwelveData REST API for {symbol}")
+        
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         
         data = response.json()
         
         if "status" in data and data["status"] == "error":
+            logger.error(f"TwelveData API error: {data.get('message')}")
             raise HTTPException(
                 status_code=400,
                 detail=data.get("message", "TwelveData API error")
@@ -118,8 +299,10 @@ async def get_candles(
                     "volume": float(item.get("volume", 0))
                 })
             except (ValueError, TypeError) as e:
-                print(f"⚠️ Skipping invalid candle: {e}")
+                logger.warning(f"⚠️ Skipping invalid candle: {e}")
                 continue
+        
+        logger.info(f"✅ Successfully fetched {len(candles)} candles for {symbol}")
         
         return {
             "success": True,
@@ -130,16 +313,19 @@ async def get_candles(
         }
     
     except requests.exceptions.Timeout:
+        logger.error("TwelveData API timeout")
         raise HTTPException(
             status_code=504,
             detail="TwelveData API timeout"
         )
     except requests.exceptions.RequestException as e:
+        logger.error(f"TwelveData request failed: {str(e)}")
         raise HTTPException(
             status_code=502,
             detail=f"Failed to fetch data from TwelveData: {str(e)}"
         )
     except Exception as e:
+        logger.error(f"Internal error: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Internal error: {str(e)}"
@@ -147,9 +333,7 @@ async def get_candles(
 
 @app.get("/news")
 async def get_news():
-    """
-    Fetch high-impact economic news from Finlight API
-    """
+    """Fetch high-impact economic news from Finlight API"""
     if not FINLIGHT_API_KEY:
         return {
             "success": False,
@@ -202,30 +386,55 @@ async def get_news():
         }
 
 @app.websocket("/ws")
-async def websocket_route(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for real-time price updates
+    WebSocket endpoint for REAL-TIME price streaming
     
-    Usage:
-    1. Connect to: wss://anso-vision-data-fetcher.onrender.com/ws
-    2. Send: {"action": "subscribe", "symbol": "EUR/USD"}
-    3. Receive: {"type": "price_update", "symbol": "EUR/USD", "price": 1.0850, "timestamp": 1234567890}
+    This streams live prices for symbols in the watchlist
+    
+    Protocol:
+    - Client sends: {"action": "subscribe", "symbols": ["EUR/USD", "BTC/USD"]}
+    - Client sends: {"action": "unsubscribe", "symbols": ["EUR/USD"]}
+    - Server sends: {"type": "price_update", "symbol": "EUR/USD", "price": 1.0850, "timestamp": 1234567890}
     """
-    await websocket_endpoint(websocket)
-
-@app.get("/start")
-async def start_fetcher():
-    """Manual trigger to restart services"""
-    return {
-        "status": "noted",
-        "message": "WebSocket streaming is enabled"
-    }
+    await ws_manager.connect_frontend(websocket)
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            action = data.get("action")
+            symbols = data.get("symbols", [])
+            
+            if action == "subscribe" and symbols:
+                ws_manager.subscribe_symbols(symbols)
+                await websocket.send_json({
+                    "type": "subscribed",
+                    "symbols": symbols,
+                    "status": "success"
+                })
+                
+            elif action == "unsubscribe" and symbols:
+                ws_manager.unsubscribe_symbols(symbols)
+                await websocket.send_json({
+                    "type": "unsubscribed",
+                    "symbols": symbols,
+                    "status": "success"
+                })
+                
+            elif action == "ping":
+                await websocket.send_json({"type": "pong"})
+                
+    except WebSocketDisconnect:
+        ws_manager.disconnect_frontend(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        ws_manager.disconnect_frontend(websocket)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     
-    print(f"🚀 Starting Data Fetcher Service on port {port}")
-    print(f"🔒 CORS Origins: {ALLOWED_ORIGINS}")
+    logger.info(f"🚀 Starting Data Fetcher Service on port {port}")
+    logger.info(f"🔒 CORS Origins: {ALLOWED_ORIGINS}")
     
     uvicorn.run(
         "main:app",
