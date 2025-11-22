@@ -1,8 +1,11 @@
 import os
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import requests
+
+# Import WebSocket server
+from websocket_server import websocket_endpoint, init_websocket
 
 app = FastAPI(
     title="Anso Vision Data Fetcher",
@@ -32,6 +35,10 @@ async def startup_event():
     print(f"📊 Backend URL: {BACKEND_URL}")
     print(f"🔑 TwelveData API: {'Configured' if TWELVEDATA_API_KEY else 'Missing'}")
     print(f"📰 Finlight API: {'Configured' if FINLIGHT_API_KEY else 'Missing'}")
+    
+    # Initialize WebSocket connection to TwelveData
+    await init_websocket()
+    print("📡 WebSocket server initialized")
 
 @app.get("/")
 async def root():
@@ -43,7 +50,8 @@ async def root():
         "endpoints": {
             "candles": "/candles/{symbol}",
             "news": "/news",
-            "health": "/health"
+            "health": "/health",
+            "websocket": "/ws"
         }
     }
 
@@ -54,7 +62,8 @@ async def health_check():
         "status": "healthy",
         "service": "Data Fetcher",
         "twelvedata_api": "configured" if TWELVEDATA_API_KEY else "missing",
-        "finlight_api": "configured" if FINLIGHT_API_KEY else "missing"
+        "finlight_api": "configured" if FINLIGHT_API_KEY else "missing",
+        "websocket": "enabled"
     }
 
 @app.get("/candles/{symbol}")
@@ -192,12 +201,24 @@ async def get_news():
             "impactful_events": []
         }
 
+@app.websocket("/ws")
+async def websocket_route(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time price updates
+    
+    Usage:
+    1. Connect to: wss://anso-vision-data-fetcher.onrender.com/ws
+    2. Send: {"action": "subscribe", "symbol": "EUR/USD"}
+    3. Receive: {"type": "price_update", "symbol": "EUR/USD", "price": 1.0850, "timestamp": 1234567890}
+    """
+    await websocket_endpoint(websocket)
+
 @app.get("/start")
 async def start_fetcher():
     """Manual trigger to restart services"""
     return {
         "status": "noted",
-        "message": "WebSocket streaming not yet implemented"
+        "message": "WebSocket streaming is enabled"
     }
 
 if __name__ == "__main__":
