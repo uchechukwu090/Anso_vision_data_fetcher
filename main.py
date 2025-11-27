@@ -20,14 +20,13 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# CORS Configuration
-ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
+# CORS Configuration - ALLOW ALL ORIGINS (for now)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
 )
 
 # Environment variables
@@ -128,9 +127,10 @@ class WebSocketManager:
         logger.info("✅ Connected to TwelveData WebSocket")
         self.is_connected = True
         
-        # Subscribe to all symbols
-        if self.subscribed_symbols:
-            self.subscribe_symbols(list(self.subscribed_symbols))
+        # Subscribe to all symbols (only when explicitly requested)
+        # Auto-subscription disabled - symbols must be subscribed via /ws endpoint
+        # if self.subscribed_symbols:
+        #     self.subscribe_symbols(list(self.subscribed_symbols))
     
     def connect_to_twelvedata(self):
         """Connect to TwelveData WebSocket"""
@@ -208,6 +208,7 @@ async def startup_event():
     logger.info(f"📊 Backend URL: {BACKEND_URL}")
     logger.info(f"🔑 TwelveData API: {'Configured' if TWELVEDATA_API_KEY else 'Missing'}")
     logger.info(f"📰 Finlight API: {'Configured' if FINLIGHT_API_KEY else 'Missing'}")
+    logger.info(f"🌐 CORS: Allowing ALL origins")
     
     # Connect to TwelveData WebSocket
     ws_manager.connect_to_twelvedata()
@@ -219,6 +220,7 @@ async def root():
         "service": "Anso Vision Data Fetcher",
         "version": "2.0.0",
         "status": "running",
+        "cors": "enabled (all origins)",
         "websocket_status": "connected" if ws_manager.is_connected else "disconnected",
         "subscribed_symbols": list(ws_manager.subscribed_symbols),
         "endpoints": {
@@ -235,6 +237,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Data Fetcher",
+        "cors": "enabled",
         "twelvedata_api": "configured" if TWELVEDATA_API_KEY else "missing",
         "finlight_api": "configured" if FINLIGHT_API_KEY else "missing",
         "websocket_connected": ws_manager.is_connected,
@@ -250,8 +253,6 @@ async def get_candles(
 ):
     """
     Fetch historical OHLC candle data from TwelveData REST API
-    
-    This is for ON-DEMAND analysis when user clicks "Analyze"
     """
     logger.info(f"📊 Fetching candles for {symbol}, interval: {interval}")
     
@@ -270,8 +271,6 @@ async def get_candles(
             "apikey": TWELVEDATA_API_KEY,
             "format": "JSON"
         }
-        
-        logger.info(f"Calling TwelveData REST API for {symbol}")
         
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
@@ -387,16 +386,7 @@ async def get_news():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for REAL-TIME price streaming
-    
-    This streams live prices for symbols in the watchlist
-    
-    Protocol:
-    - Client sends: {"action": "subscribe", "symbols": ["EUR/USD", "BTC/USD"]}
-    - Client sends: {"action": "unsubscribe", "symbols": ["EUR/USD"]}
-    - Server sends: {"type": "price_update", "symbol": "EUR/USD", "price": 1.0850, "timestamp": 1234567890}
-    """
+    """WebSocket endpoint for REAL-TIME price streaming"""
     await ws_manager.connect_frontend(websocket)
     
     try:
@@ -434,7 +424,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     
     logger.info(f"🚀 Starting Data Fetcher Service on port {port}")
-    logger.info(f"🔒 CORS Origins: {ALLOWED_ORIGINS}")
+    logger.info(f"🌐 CORS: Allowing ALL origins")
     
     uvicorn.run(
         "main:app",
