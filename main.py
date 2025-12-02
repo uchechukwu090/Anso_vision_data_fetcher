@@ -42,6 +42,7 @@ class WebSocketManager:
         self.is_connected = False
         self.subscribed_symbols: Set[str] = set()
         self.latest_prices: Dict[str, dict] = {}
+        self.candle_aggregators: Dict[str, 'CandleAggregator'] = {}  # symbol -> aggregator
         
     async def connect_frontend(self, websocket: WebSocket):
         """Accept frontend WebSocket connection"""
@@ -100,6 +101,15 @@ class WebSocketManager:
                 price = float(data.get("price", 0))
                 timestamp = int(data.get("timestamp", 0))
                 
+                # Initialize aggregator if needed
+                if symbol not in self.candle_aggregators:
+                    from candle_aggregator import CandleAggregator
+                    self.candle_aggregators[symbol] = CandleAggregator(timeframe_minutes=60)
+                    self.candle_aggregators[symbol].on_candle_complete = self.on_candle_complete
+                
+                # Process tick into candle
+                self.candle_aggregators[symbol].process_tick(symbol, price, timestamp)
+                
                 # Broadcast to frontend clients (run in event loop)
                 asyncio.run_coroutine_threadsafe(
                     self.broadcast_price(symbol, price, timestamp),
@@ -111,6 +121,28 @@ class WebSocketManager:
                 
         except Exception as e:
             logger.error(f"Error processing TwelveData message: {e}")
+    
+    async def on_candle_complete(self, symbol: str, candles: list):
+        """Called when a new candle completes"""
+        logger.info(f"🕯️ Candle completed for {symbol}, triggering analysis...")
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    f"{BACKEND_URL}/api/candle-complete",
+                    json={
+                        "symbol": symbol,
+                        "candles": candles
+                    }
+                )
+                
+                if response.status_code == 200:
+                    logger.info(f"✅ Analysis triggered for {symbol}")
+                else:
+                    logger.warning(f"⚠️ Backend returned {response.status_code}")
+        
+        except Exception as e:
+            logger.error(f"❌ Failed to trigger analysis: {e}")
     
     def on_twelvedata_error(self, ws, error):
         logger.error(f"TwelveData WebSocket error: {error}")
@@ -249,7 +281,7 @@ async def health_check():
 async def get_candles(
     symbol: str,
     interval: str = "1h",
-    outputsize: int = 100
+    outputsize: int = 250
 ):
     """
     Fetch historical OHLC candle data from TwelveData REST API
