@@ -4,3 +4,4 @@ websocket-client
 requests
 supabase
 websockets
+httpx
